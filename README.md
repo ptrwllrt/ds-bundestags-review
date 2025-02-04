@@ -1,4 +1,4 @@
-# My Python Project
+# Bundestags Review
 
 This project is designed to read Plenarprotokolle from the bundesAPI. It provides functionality to make API requests and process the responses effectively.
 
@@ -21,7 +21,7 @@ the-project
 
    ```
    git clone <repository-url>
-   cd the_project
+   cd ds-bundestags-review
    ```
 
 2. Install the required dependencies:
