@@ -2,3 +2,4 @@ requests
 pandas
 jsonschema
 bundestagsapy
+load_dotenv

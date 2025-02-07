@@ -1,8 +1,17 @@
 import os
 import csv
 import BundestagsAPy
+import click
 from datetime import datetime, date, timedelta
 import calendar
+import pandas as pd
+import re
+from config import Config
+
+class Config:
+    API_KEY = os.getenv('API_KEY')
+    INPUT_DIR = os.getenv('INPUT_DIR', 'output')  # default if not set
+    OUTPUT_DIR = os.getenv('OUTPUT_DIR', 'output_cleaned')  # default if not set
 
 # Define expected CSV columns
 CSV_COLUMNS = [
@@ -109,17 +118,134 @@ def save_item_to_file(item, output_dir='output'):
     except Exception as e:
         print(f"Error saving item {item_id}: {e}")
 
-def main():
-    api_key = "I9FKdCn.hbfefNWCY336dL6x62vfwNKpoN2RZ1gp21"  # Replace with your actual API key
-    api = BundestagsAPy.Client(api_key)  # Initialize the API client
+# data cleaning
+
+def filter_stenography_part(text):
+    try:
+        start = re.search(r'\bSitzung\b.*?\beröffn|\beröffn*?\bSitzung\b', text, re.IGNORECASE | re.DOTALL).span()[0]
+        #start = re.search(r'Die Sitzung ist eröffnet.|Ich eröffne die Sitzung|Sitzung eröffnet',text).span()[0] #this is always in the first line of the opening of the session
+    except AttributeError:
+        start = re.search(r'Bitte nehmen Sie Platz.',text).span()[0] #sometimes the opening is not in the text, then we have to use this as a fallback
+    #second to last new line character before the end of the stenographic transcript
+    start = text[:start].rfind('\n',start-500,start)
+    start = text[:start].rfind('\n',start-500,start)+1
+    end = re.search(r'\(Schluss[\w\s]*: \d{1,2}.\d{1,2} Uhr\)',text).span()[0] #this is always the end of the stenographic transcript
+    return text[start:end]
+
+def get_speech_positions(text):
+    #speeches always start with the name of the speaker and the party in brackets, e.g. Annalena Baerbock (BÜNDNIS 90/DIE GRÜNEN):
+    parties = [r'\(CDU/CSU\):\n',r'\(SPD\):\n',r'\(AfD\):\n',r'\(FDP\):\n',r'\(DIE LINKE\):\n',r'\(BÜNDNIS 90/DIE GRÜNEN\):\n']
+    end_pattern = re.compile(r'\nVizepräsident\w{0,2}\s[\w\s.-]+:\n|\nPräsident\w{0,2}\s[\w\s.-]+:\n')
+    speeches = {}
+    for party in parties:
+        pattern = re.compile(party)
+        starts = []
+        for m in re.finditer(pattern,text):
+            start = m.span()[0]
+            start = text[:start].rfind('\n',start-500,start)
+            starts.append(start)
+        #find end
+        spans = []
+        for s in starts:
+            end = re.search(end_pattern,text[s:]).span()[0]+s
+            spans.append((s,end))
+        party_text = party.replace(r'\(','').replace(r'\):','').replace(r'\n','').strip()
+        speeches[party_text] = spans
+    return speeches
+
+def get_speeches(text,positions):
+    speeches = {}
+    for party in positions.keys():
+        party_speeches = []
+        for start,end in positions[party]:
+            party_speeches.append(text[start:end])
+        speeches[party] = party_speeches
+    return speeches
+
+def clean_speech(speech):
+    speaker = speech[1:].split('\n')[0]
+    speech = speech.replace(speaker,'')
+    speaker = speaker.split('(')[0].strip()
+    #remove any statements not by the speaker (in paranthesis, e.g. applause)
+    speech = re.sub(r'\([^\)]+\)','',speech)
+    #replace newline characters
+    speech = speech.replace('\n',' ').strip()
+    return (speaker,speech)
+
+def build_dataframe(speeches):
+    data = []
+    for party in speeches.keys():
+        for speaker,speech in speeches[party]:
+            data.append([party,speaker,speech])
+    return pd.DataFrame(data,columns=['party','speaker','speech'])
+
+def clean_transcript(transcript):
+    text = transcript.text.replace("\xa0",' ')
+    text = filter_stenography_part(text)
+    positions = get_speech_positions(text)
+    speeches = get_speeches(text,positions)
+    clean_speeches = {}
+    for party in speeches.keys():
+        clean_speeches[party] = [clean_speech(s) for s in speeches[party]]
+    df = build_dataframe(clean_speeches)
+    df['date'] = transcript.datum
+    return df
+
+def download_protocols():
+    """Download protocols from Bundestag API"""
+    api = BundestagsAPy.Client(Config.API_KEY)  # Initialize the API client
     try:
         data = fetch_plenarprotokolle(api)
         for item in data:
             save_item_to_file(item)
         print(f"Successfully saved {len(data)} new protocols")
-        
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error downloading protocols: {e}")
+
+def process_csv_files(input_dir='output', output_dir='output_cleaned'):
+    """Process all CSV files and create cleaned versions"""
+    os.makedirs(output_dir, exist_ok=True)
+    csv_files = [f for f in os.listdir(input_dir) if f.endswith('.csv')]
+    
+    for file in csv_files:
+        try:
+            print(f"Processing {file}...")
+            df = pd.read_csv(os.path.join(input_dir, file))
+            
+            transcript = type('', (), {})()
+            transcript.text = df['text'].iloc[0]
+            transcript.datum = df['datum'].iloc[0]
+            
+            tmp_df = clean_transcript(transcript)
+            df = df.drop(0)
+            df_cleaned = pd.concat([df, tmp_df], ignore_index=True)
+            
+            output_file = os.path.join(output_dir, f"{os.path.splitext(file)[0]}_cleaned.csv")
+            df_cleaned.to_csv(output_file, index=False)
+            print(f"Saved cleaned {file}")
+            
+        except Exception as e:
+            print(f"Error processing {file}: {e}")
+
+def main():
+    cli()
+
+@click.group()
+def cli():
+    """Bundestag Protocol Processing Tool"""
+    pass
+
+@cli.command()
+def download():
+    """Download protocols from Bundestag API"""
+    click.echo("Downloading protocols...")
+    download_protocols()
+
+@cli.command()
+def clean():
+    """Clean and process downloaded protocols"""
+    click.echo("Processing CSV files...")
+    process_csv_files()
 
 if __name__ == "__main__":
     main()
